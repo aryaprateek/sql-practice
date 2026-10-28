@@ -17,7 +17,7 @@ A running record of every practice question, my solution, and the traps to remem
 
 ## Question index
 
-26 questions across three sessions. Mark each one as you revise it.
+35 questions across three sessions. Mark each one as you revise it.
 
 | # | Question | Pattern | Rows | Status |
 | --- | --- | --- | --- | --- |
@@ -47,6 +47,15 @@ A running record of every practice question, my solution, and the traps to remem
 | DL1 | Page With No Likes | Anti-join | — |  |
 | DL2 | Well Paid Employees | Self-join | — |  |
 | DL3 | Signup Activation Rate | Rate, integer division | — |  |
+| W1 | Number employees by salary | ROW\_NUMBER, PARTITION BY | 6 |  |
+| W2 | ROW\_NUMBER vs RANK vs DENSE\_RANK | Ranking ties | 6 |  |
+| W3 | Top earner per department | Top-N per group | 5 |  |
+| W4 | Second-highest salary | DENSE\_RANK filter | 1 |  |
+| W5 | Every department with its second salary | Rank filter in ON | 4 |  |
+| W6 | Quarter-over-quarter change | Aggregate, then LAG | 3 |  |
+| W7 | Running total per department | SUM OVER | 3 |  |
+| W8 | ROWS vs RANGE on ties | Window frames | 4 |  |
+| W9 | Rolling average, full windows only | ROWS frame + CASE | 3 |  |
 
 ## Session 0 · 22–24 Oct 2026 · 12-question joins drill
 
@@ -207,16 +216,16 @@ Find source rows missing from the target, target rows not in the source, and dup
 
 ```sql
 -- Missing in target
-SELECT s.* FROM source_txn s
-WHERE NOT EXISTS (SELECT 1 FROM target_txn t WHERE t.txn_id = s.txn_id);
+SELECT s.* FROM src_txn s
+WHERE NOT EXISTS (SELECT 1 FROM tgt_txn t WHERE t.txn_id = s.txn_id);
 
 -- Extra in target
-SELECT t.* FROM target_txn t
-WHERE NOT EXISTS (SELECT 1 FROM source_txn s WHERE s.txn_id = t.txn_id);
+SELECT t.* FROM tgt_txn t
+WHERE NOT EXISTS (SELECT 1 FROM src_txn s WHERE s.txn_id = t.txn_id);
 
 -- Duplicated in target
 SELECT txn_id, COUNT(*) AS copies
-FROM target_txn GROUP BY txn_id HAVING COUNT(*) > 1;
+FROM tgt_txn GROUP BY txn_id HAVING COUNT(*) > 1;
 ```
 
 **Note:** Never compare totals by joining source to target directly: target duplicates fan out. De-duplicate or count in a CTE first, then compare. Practise writing it solo within 15 minutes.
@@ -531,6 +540,12 @@ ORDER BY dept_id, salary_rank;
 
 ### W2. ROW\_NUMBER vs RANK vs DENSE\_RANK with a tie (company-wide)
 
+> **Setup note:** this question needs Ravi tied with Meena at 75,000. Run this first and keep it in place through W5.
+
+```sql
+UPDATE employees SET salary = 75000 WHERE emp_name = 'Ravi';
+```
+
 ```sql
 SELECT emp_name, salary,
        ROW_NUMBER() OVER (ORDER BY salary DESC, emp_id) AS row_num,
@@ -551,6 +566,14 @@ FROM employees;
 **Notes:** RANK skips after a tie; DENSE\_RANK doesn't (dense = no gaps). With no partition, it's one company-wide list. ROW\_NUMBER breaks ties arbitrarily, so add a tiebreaker (emp\_id) for repeatable results.
 
 ### W3. Top earner per department, keeping ties
+
+> **Setup note:** this question needs a tie. Run this first so Karan ties Meena at 75,000 in dept 20; expected result is then 5 rows (Asha, Meena, Karan, Arjun, Divya).
+
+```sql
+UPDATE employees SET salary = 75000 WHERE emp_name = 'Karan';
+```
+
+Keep both Ravi and Karan at 75,000 through W4 and W5 (W4 then returns 1 row: Ravi). After W5, reset by re-running 00\_setup\_joinspractice.sql.
 
 ```sql
 WITH ranked AS (
@@ -599,6 +622,88 @@ ORDER BY d.dept_id;
 
 **Notes:** Departments are the base; the rank filter goes in ON, not WHERE (same lesson as Q9). Using `rank <> 2` in WHERE does the opposite of what's needed. Show the salary, not the rank, and sort by d.dept\_id; sorting by r.emp\_id puts NULL rows first.
 
+## Session 3 · Day 3 (Wed 28 Oct): window functions II
+
+Database: JoinsPractice, `sales` table (4 rows: dept 10 Q1 5000, dept 10 Q1 3000, dept 10 Q2 2000, dept 20 Q2 4000). Core rule: **LAG compares rows, not periods.** Get to one row per period first, then apply the window function.
+
+### W6. Quarter-over-quarter change per department (3 rows)
+
+One row = one department in one quarter. Dept 10 Q2: previous 8000, change -6000. Other rows NULL.
+
+```sql
+WITH ct AS (
+    SELECT dept_id, quarter, SUM(amount) AS total_amount
+    FROM sales
+    GROUP BY dept_id, quarter
+)
+SELECT dept_id, quarter, total_amount,
+       LAG(total_amount) OVER (PARTITION BY dept_id ORDER BY quarter) AS previous_qtr,
+       total_amount - LAG(total_amount) OVER (PARTITION BY dept_id ORDER BY quarter) AS change
+FROM ct;
+```
+
+**Common pitfalls:** Joining sales to employees on dept\_id fans out (4 rows became 8). Running LAG on raw rows compares Q1 with Q1 when a period has two rows, and tie order is arbitrary. Joining the CTE back to sales fans out again (10 rows). Prefer NULL over 0 as the LAG default: no previous quarter is not the same as zero sales.
+
+### W7. Running total per department (3 rows)
+
+Expected: 8000, 10000, 4000. PARTITION BY restarts the total for each department.
+
+```sql
+WITH ct AS (
+    SELECT dept_id, quarter, SUM(amount) AS total_amount
+    FROM sales
+    GROUP BY dept_id, quarter
+)
+SELECT dept_id, quarter, total_amount,
+       SUM(total_amount) OVER (PARTITION BY dept_id ORDER BY quarter) AS running_total
+FROM ct;
+```
+
+**Notes:** ORDER BY inside OVER is what makes it cumulative. Remove it and every row gets its department's grand total (useful for percent of total). Name the column `running_total`, not `previous_qtr`.
+
+### W8. ROWS vs RANGE on tied rows (raw sales, 4 rows)
+
+```sql
+SELECT dept_id, quarter, amount,
+       SUM(amount) OVER (PARTITION BY dept_id ORDER BY quarter
+                         RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS range_total,
+       SUM(amount) OVER (PARTITION BY dept_id ORDER BY quarter
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_total
+FROM sales;
+```
+
+| dept\_id | quarter | RANGE | ROWS |
+| --- | --- | --- | --- |
+| 10 | Q1 | 8000 | 5000 |
+| 10 | Q1 | 8000 | 8000 |
+| 10 | Q2 | 10000 | 10000 |
+| 20 | Q2 | 4000 | 4000 |
+
+**Notes:** RANGE treats rows with the same ORDER BY value as peers, so tied Q1 rows both see all of Q1. ROWS counts physical rows. The default frame with ORDER BY is RANGE, so ties make a running total jump in steps; use ROWS plus a unique tiebreaker for a true row-by-row total. In SQL Server, RANGE only supports UNBOUNDED and CURRENT ROW; offsets like `1 PRECEDING` need ROWS. Common pitfall: forgetting the running total doesn't restart at a new quarter, only at a new partition.
+
+### W9. Two-quarter rolling average, full windows only (3 rows)
+
+Plain rolling average: 8000, 5000, 4000. Full windows only: NULL, 5000, NULL.
+
+```sql
+WITH ct_avg AS (
+    SELECT dept_id, quarter, SUM(amount) AS total_amount
+    FROM sales
+    GROUP BY dept_id, quarter
+)
+SELECT dept_id, quarter, total_amount,
+       CASE
+         WHEN COUNT(total_amount) OVER (PARTITION BY dept_id ORDER BY quarter
+              ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) < 2
+         THEN NULL
+         ELSE AVG(total_amount) OVER (PARTITION BY dept_id ORDER BY quarter
+              ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+       END AS rolling_avg
+FROM ct_avg;
+```
+
+**Notes:** The first row of a rolling window averages over itself only, unlike LAG which returns NULL. Window functions can't be nested, so COUNT and AVG sit side by side inside a CASE. Wrap AVG in ROUND or CAST to tidy the decimals. Red IntelliSense markers on CTE columns are a stale cache (Ctrl+Shift+R), not real errors.
+
 ## Case questions · Tue 27 Oct 2026
 
 The common trap: jumping straight to causes. Same fix as SQL: picture the structure before answering.
@@ -631,5 +736,14 @@ The common trap: jumping straight to causes. Same fix as SQL: picture the struct
 - **Scenario:** new users flat at 1M, returning flat, so retention dropped (churn rose).
 - **Next:** slice churned users by country, device, plan, and new vs long-time subscribers; split voluntary cancellations from failed payments (silent churn).
 - **Common pitfalls:** Opening with causes (an app update, a rival's new series); saying "check the formula" without writing it; concluding "moved to a rival app" before slicing.
+
+### Case 4. Payments app: successful UPI transactions down 12% week on week
+
+- **Is it real?** Check the definition of "successful" is the same in both weeks, there's no logging or pipeline change, and the data is complete. Check whether last week was inflated (cashback offer, festival, salary day) and compare with the same week last month or last year.
+- **What is it made of?** Successful transactions = active users × attempts per user × success rate. Ask how the interviewer defines "successful", but propose the breakdown yourself. A valid breakdown multiplies back to the metric exactly and fits the business (no cart in a payments app).
+- **Which part moved?** Compute all three for both weeks before guessing causes. Retries after failures inflate attempts per user, so a success-rate problem can look like an attempts problem. Scenario: success rate fell 95% → 84%.
+- **Slice:** all transactions are UPI, so slicing by payment method splits nothing. Use failure reason code first (technical timeouts vs business declines like wrong PIN or insufficient funds), then payer's bank, platform or app version, and time of day.
+- **Conclusion and recommendation:** timeouts concentrated at one payer's bank. You can't reroute around the customer's own bank; rerouting only helps if the fault is at the app's partner (PSP) bank. Escalate to the bank and NPCI, show an in-app banner, prompt users to pay from another linked account, track success rate daily, and quantify the lost transactions per day.
+- **Common trap:** jumping to causes (gateway, wrong PIN) before establishing which component moved.
 
 **Other case types to practise:** measuring whether a new feature worked; designing an A/B test.
