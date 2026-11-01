@@ -1,4 +1,5 @@
--- Author: Prateek Arya (main version)
+-- Author: Prateek Arya
+
 --Question 1---------------------------------------------------------------------
 WITH emp_salary  AS (
 	SELECT e.emp_name, e.dept_id, d.dept_name, e.salary
