@@ -17,7 +17,7 @@ A running record of every practice question, my solution, and the traps to remem
 
 ## Question index
 
-35 questions across three sessions. Mark each one as you revise it.
+42 questions across five sessions. Mark each one as you revise it.
 
 | # | Question | Pattern | Rows | Status |
 | --- | --- | --- | --- | --- |
@@ -56,6 +56,13 @@ A running record of every practice question, my solution, and the traps to remem
 | W7 | Running total per department | SUM OVER | 3 |  |
 | W8 | ROWS vs RANGE on ties | Window frames | 4 |  |
 | W9 | Rolling average, full windows only | ROWS frame + CASE | 3 |  |
+| C1 | Employees above their department average | CTE: join → window → filter | 2 |  |
+| C2 | At or above 75% of department top salary | MAX OVER + GROUP BY | 2 |  |
+| C3 | Above-average sales per department | Conditional aggregation | 2 |  |
+| G1 | Login streaks | Gaps and islands | 5 |  |
+| T1 | Salary band report with rank in band | Range join + DENSE\_RANK | 6 |  |
+| T2 | Department share of quarterly sales | CROSS JOIN + window SUM | 8 |  |
+| T3 | Longest login streak per employee | Gaps and islands + ROW\_NUMBER | 2 |  |
 
 ## Session 0 · 22–24 Oct 2026 · 12-question joins drill
 
@@ -703,6 +710,253 @@ FROM ct_avg;
 ```
 
 **Notes:** The first row of a rolling window averages over itself only, unlike LAG which returns NULL. Window functions can't be nested, so COUNT and AVG sit side by side inside a CASE. Wrap AVG in ROUND or CAST to tidy the decimals. Red IntelliSense markers on CTE columns are a stale cache (Ctrl+Shift+R), not real errors.
+
+## Session 4 · Day 4 (Sun 1 Nov): CTE decomposition and gaps and islands
+
+Database: JoinsPractice (`employees`, `departments`, `sales`), plus a new `logins` table for G1. Core rule: **one CTE per job — join, window, filter, aggregate.** Run each CTE on its own and check its row count before writing the next.
+
+### C1. Employees above their department average
+
+One row = an employee earning more than their department's average. Expected 2 rows: Asha (120000 vs 100000) and Meena (75000 vs 67500).
+
+```sql
+WITH emp_salary AS (
+    SELECT e.emp_id, e.emp_name, e.dept_id, d.dept_name, e.salary
+    FROM employees e
+    JOIN departments d ON e.dept_id = d.dept_id
+),
+dept_avg AS (
+    SELECT *,
+           AVG(salary) OVER (PARTITION BY dept_id) AS avg_dept_salary
+    FROM emp_salary
+)
+SELECT emp_name, dept_name, salary, avg_dept_salary
+FROM dept_avg
+WHERE salary > avg_dept_salary;
+```
+
+**Notes:** INNER JOIN, not LEFT: someone with no real department has no department average. With a LEFT JOIN and `PARTITION BY dept_name`, Divya and Arjun share one NULL partition (average 62500), so Divya wrongly shows up. Let the question pick the join, not "keep everyone". A window function can't be filtered in the WHERE of the same SELECT, because WHERE runs before windows are calculated; filter in the next layer. Partition on `dept_id`, the key, not `dept_name`.
+
+### C2. Count at or above 75% of the department's top salary
+
+All four layers. Thresholds: Analytics 90000, Finance 56250. Filter layer = 3 rows (Asha, Meena, Karan); final = 2 rows: Analytics 1, Finance 2.
+
+```sql
+WITH emp_salary AS (
+    SELECT e.emp_id, e.emp_name, e.dept_id, d.dept_name, e.salary
+    FROM employees e
+    JOIN departments d ON e.dept_id = d.dept_id
+),
+max_sal AS (
+    SELECT *,
+           MAX(salary) OVER (PARTITION BY dept_id) AS max_dept_salary
+    FROM emp_salary
+)
+SELECT dept_id, dept_name, COUNT(emp_id) AS emp_count
+FROM max_sal
+WHERE salary >= max_dept_salary * 0.75
+GROUP BY dept_id, dept_name;
+```
+
+**Common pitfalls:** ROW\_NUMBER gives a position (1, 2), not the top value. TOP 1 isn't a window function: it cuts the whole result to one row. Any aggregate (SUM, AVG, MIN, MAX, COUNT) plus OVER keeps every row and adds the group's value alongside. Comparing `salary >= salary * 0.75` is always true; compare against the department max.
+
+### C3. Above-average sales per department
+
+Expected 2 rows: Analytics 1 sale / 5000 (average 3333.33), Finance 0 / 0 (its one sale of 4000 equals its average).
+
+```sql
+WITH dept_sales AS (
+    SELECT d.dept_id, d.dept_name, s.sale_id, s.amount
+    FROM departments d
+    JOIN sales s ON d.dept_id = s.dept_id
+),
+avg_sales AS (
+    SELECT *,
+           AVG(amount) OVER (PARTITION BY dept_id) AS avg_sales
+    FROM dept_sales
+)
+SELECT dept_name,
+       COUNT(CASE WHEN amount > avg_sales THEN sale_id END)      AS count_of_sales,
+       SUM(CASE WHEN amount > avg_sales THEN amount ELSE 0 END) AS total_sales_amount
+FROM avg_sales
+GROUP BY dept_id, dept_name;
+```
+
+**Notes:** A WHERE filter drops Finance entirely; **conditional aggregation** (the condition inside COUNT/SUM) keeps it with 0. A WHERE after a LEFT JOIN can quietly undo it: Marketing and HR have NULL amounts, and `NULL > NULL` is unknown, so they vanish. Write the plan (row count per layer, final numbers) before the SQL — this one was written without it.
+
+### G1. Login streaks (gaps and islands)
+
+One row = one streak of consecutive login days. Expected 5 rows: Asha 1–3 Oct (3), 5–6 Oct (2), 9 Oct (1); Ravi 1–2 Oct (2), 4 Oct (1).
+
+Setup (add-on, doesn't touch the other tables):
+
+```sql
+DROP TABLE IF EXISTS dbo.logins;
+CREATE TABLE dbo.logins (
+    emp_id     INT  NOT NULL,
+    login_date DATE NOT NULL
+);
+INSERT INTO dbo.logins VALUES
+(1,'2026-10-01'),(1,'2026-10-02'),(1,'2026-10-03'),
+(1,'2026-10-05'),(1,'2026-10-06'),(1,'2026-10-09'),
+(2,'2026-10-01'),(2,'2026-10-02'),(2,'2026-10-04');
+```
+
+```sql
+WITH grp_login AS (
+    SELECT emp_id, login_date,
+           DATEADD(DAY, -ROW_NUMBER() OVER (PARTITION BY emp_id ORDER BY login_date), login_date) AS grp
+    FROM logins
+)
+SELECT emp_id,
+       MIN(login_date) AS start_date,
+       MAX(login_date) AS end_date,
+       COUNT(*)        AS length_days
+FROM grp_login
+GROUP BY emp_id, grp
+ORDER BY emp_id, start_date;
+```
+
+**Notes:** Inside a streak, the date and the row number both rise by 1, so date minus row number stays constant; a gap changes it. The `grp` date means nothing on its own — it's just a label. A one-day streak starts and ends on the same date (not NULL). You can't GROUP BY an aggregate (Msg 144), but ORDER BY can use SELECT aliases because it runs last: FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY. Duplicate login dates break ROW\_NUMBER: take DISTINCT dates first or use DENSE\_RANK. END is a reserved word, so use `end_date` or `[end]`, never a quoted alias.
+
+## Session 5 · Day 5 (Sun 1 Nov): timed mixed SQL
+
+Database: JoinsPractice (`employees`, `departments`, `salary_bands`, `sales`, `quarters`, `logins`). 15 minutes per problem. Core rule: **answer grain, joins and functions before writing SQL, then build one CTE at a time.**
+
+### T1. Salary band report with rank in band
+
+One row = one employee. Expected 6 rows: A: Asha 1 · B: Ravi 1, Meena 2, Divya 3 · C: Karan 1, Arjun 2. Divya and Arjun show 'Unknown' department.
+
+```sql
+WITH emp_details AS (
+    SELECT e.emp_name, COALESCE(d.dept_name, 'Unknown') AS dept_name, e.salary, sl.band_name
+    FROM employees e
+    LEFT JOIN departments d ON e.dept_id = d.dept_id
+    JOIN salary_bands sl ON e.salary BETWEEN sl.min_salary AND sl.max_salary
+)
+SELECT *,
+    DENSE_RANK() OVER (PARTITION BY band_name ORDER BY salary DESC) AS rank_in_band
+FROM emp_details
+ORDER BY band_name, rank_in_band;
+```
+
+**Notes:** The band join is a range (non-equi) join: there is no shared key, the condition is `BETWEEN`. Divya's 70,000 sits exactly on band B's lower edge, so inclusive BETWEEN matters. INNER JOIN to bands works here only because every salary has a band; LEFT JOIN is safer when the question says "every employee". Rank by `salary DESC`, not by the band. Without ORDER BY, row order is never guaranteed, even when it looks sorted. Solved in 5 minutes.
+
+### T2. Department share of quarterly sales
+
+One row = one department in one quarter. Expected 8 rows (4 departments × 2 quarters): Q1 Analytics 8,000 = 100.0%, others 0.0 · Q2 Finance 4,000 = 66.7%, Analytics 2,000 = 33.3%, others 0.0.
+
+```sql
+WITH dept_qtr_sales AS (
+    SELECT d.dept_name, q.quarter, s.amount
+    FROM departments d
+    CROSS JOIN quarters q
+    LEFT JOIN sales s ON d.dept_id = s.dept_id AND q.quarter = s.quarter
+),
+total_sales AS (
+    SELECT dept_name, quarter,
+        COALESCE(SUM(amount), 0) AS total_sales
+    FROM dept_qtr_sales
+    GROUP BY dept_name, quarter
+)
+SELECT dept_name, quarter, total_sales,
+    SUM(total_sales) OVER (PARTITION BY quarter) AS quarter_sales,
+    CAST(total_sales * 100.0
+         / NULLIF(SUM(total_sales) OVER (PARTITION BY quarter), 0)
+         AS DECIMAL(5,1)) AS pct_of_quarter
+FROM total_sales
+ORDER BY quarter, total_sales DESC;
+```
+
+**Notes:** "Every X in every Y" = X × Y rows, so start from a CROSS JOIN; GROUP BY can't create rows that don't exist. Join sales on both dept\_id and quarter. The raw join gives 9 rows (Analytics–Q1 has two sales, a fan-out); the grouped layer brings it back to 8, so check row counts per layer. `SELECT *` with GROUP BY fails (Msg 8120): every column must be grouped or aggregated. SUM of only NULLs is NULL, hence COALESCE. A window SUM puts the quarter total on every row without collapsing them; HAVING only filters groups. **Round once, at the last step:** casting the ratio to DECIMAL(5,1) before `* 100` gave 70.0 / 30.0 instead of 66.7 / 33.3. `100.0` first avoids integer division; NULLIF avoids divide-by-zero. Add `dept_name` as a tiebreaker in ORDER BY so the zero rows sort the same every run.
+
+### T3. Longest login streak per employee
+
+One row = one employee's longest streak. Expected 2 rows: Asha 1–3 Oct (3) · Ravi 1–2 Oct (2).
+
+```sql
+WITH grp_logins AS (
+    SELECT l.emp_id, e.emp_name, l.login_date,
+        DATEADD(DAY, -ROW_NUMBER() OVER (PARTITION BY l.emp_id ORDER BY login_date), login_date) AS grp
+    FROM logins l
+    JOIN employees e ON l.emp_id = e.emp_id
+),
+islands AS (
+    SELECT emp_id, emp_name, grp, COUNT(*) AS streak_days,
+        MIN(login_date) AS streak_start, MAX(login_date) AS streak_end
+    FROM grp_logins
+    GROUP BY emp_id, emp_name, grp
+),
+ranked AS (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY emp_id ORDER BY streak_days DESC, streak_start ASC) AS rank
+    FROM islands
+)
+SELECT emp_name, streak_start, streak_end, streak_days
+FROM ranked
+WHERE rank = 1;
+```
+
+**Notes:** Three layers: group key (9 rows) → islands (5 rows) → rank and keep 1 (2 rows). The group key needs its own CTE because GROUP BY runs before window functions. COUNT belongs in the layer that collapses rows into islands; counting in the ranking layer gives 1 for every streak. `MAX(streak_days)` gives the length but loses the start and end dates, so use ROW\_NUMBER with `streak_start ASC` as the tiebreaker (RANK would return two rows on a tie). Name columns for what they hold: calling the date label `streak_days` caused the first attempt to fail. `rn` is safer than `rank` as an alias. Took 18 minutes, 3 over.
+
+## Session 5b · Day 5 (Sun 1 Nov): Pandas I, SQL to Pandas
+
+Data: CSV copies of JoinsPractice `employees` (with one extra duplicate Karan row), `departments` and `sales`, in the `pandas` folder of the sql-practice repo. Notebook: `day5_pandas_I.ipynb`.
+
+| SQL | Pandas |
+| --- | --- |
+| `SELECT TOP 5 *` | `df.head()` |
+| Row and column count | `df.shape` |
+| Column types | `df.dtypes` |
+| `SELECT DISTINCT *` | `df.drop_duplicates()` |
+| Count NULLs per column | `df.isna().sum()` |
+| `CAST(col AS INT)` that allows NULL | `df["col"].astype("Int64")` (capital I) |
+| `WHERE a AND b` | `df[(cond_a) & (cond_b)]` |
+| `OR` / `NOT` | `\|` / `~` |
+| `IN (10, 20)` | `df["col"].isin([10, 20])` |
+| `IS NULL` / `IS NOT NULL` | `.isna()` / `.notna()` |
+| `SELECT a, b WHERE …` | `df.loc[mask, ["a", "b"]]` |
+| `GROUP BY … AS name` | `df.groupby("key", dropna=False).agg(name=("col", "func")).reset_index()` |
+| `COUNT(DISTINCT col)` | `("col", "nunique")` |
+| `HAVING` | filter after `agg()`: mask or `.query("headcount >= 2")` |
+| INNER / LEFT / RIGHT / FULL JOIN | `df.merge(other, on="key", how="inner" \| "left" \| "right" \| "outer")` |
+| Anti-join (`LEFT JOIN … IS NULL`) | `merge(…, how="left", indicator=True)`, keep `_merge == "left_only"` |
+
+```python
+import pandas as pd
+
+emp = pd.read_csv("employees_raw.csv")      # (7, 5): dept_id and manager_id load as float64
+emp = emp.drop_duplicates()                    # (6, 5)
+emp["dept_id"] = emp["dept_id"].astype("Int64")
+emp["manager_id"] = emp["manager_id"].astype("Int64")
+dept = pd.read_csv("departments.csv")
+
+emp[emp["dept_id"].isin([10, 20])]                               # F1: 4 rows
+emp[(emp["manager_id"].isna()) | (emp["salary"] < 60000)]       # F2: 2 rows (Asha, Arjun)
+emp[~emp["dept_id"].isin([10]) & emp["dept_id"].notna()]       # F3: 3 rows (SQL behaviour)
+
+emp.groupby("dept_id", dropna=False).agg(                         # G2: 2 rows
+    headcount=("emp_id", "count"),
+    total_salary=("salary", "sum"),
+    highest_salary=("salary", "max"),
+).reset_index().query("headcount >= 2")
+
+emp.merge(dept, on="dept_id", how="inner", indicator=True)       # M1: 4 rows
+emp.merge(dept, on="dept_id", how="left", indicator=True)        # M2: 6 rows
+emp.merge(dept, on="dept_id", how="outer", indicator=True)       # M3: 8 rows
+m = dept.merge(emp, on="dept_id", how="left", indicator=True)
+m[m["_merge"] == "left_only"]                                    # M4: 2 rows (Marketing, HR)
+```
+
+**Notes (NULL traps):**
+
+- One missing value turns a whole integer column into float64 (10 shows as 10.0), because `NaN` is a float. `astype("Int64")` gives an integer column that allows `<NA>`, like SQL's `INT NULL`. The same happens after a left or outer merge: M3 turned `emp_id` and `salary` into floats.
+- `groupby` drops the NULL group by default (Divya vanished from G1). Use `dropna=False` to match SQL.
+- `==` follows the dtype's NULL rule: on Int64, `NULL == 10` is `<NA>` and the row is dropped, like SQL; on float64 it is `False`. `isin` is a lookup and always returns `False` for a NULL on either dtype, so `~isin([10])` **keeps** Divya (4 rows), unlike SQL's `NOT IN`. Never rely on the default in a NOT filter: add `.notna()` or `.isna()` explicitly.
+- Wrap each condition in brackets when combining with `&` or `|`; Python evaluates `&` before `>`.
+- OR counting: a row needs only one condition. F2 is Asha (no manager) plus Arjun (55,000); Karan's 60,000 is not `< 60000`.
+- Outer join rows = matched + left-only + right-only (4 + 2 + 2 = 8), never the two tables added together.
+- `duplicated()` flags only the second and later copies; the first copy is kept.
 
 ## Case questions · Tue 27 Oct 2026
 
